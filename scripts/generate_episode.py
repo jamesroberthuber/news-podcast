@@ -13,6 +13,7 @@ GitHub secrets, etc.) is documented in SETUP.md.
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -33,6 +34,7 @@ VOICE_NAME = "en-US-Wavenet-D"
 # Fill this in once GitHub Pages is live (Settings -> Pages in your repo).
 SITE_URL = "https://jamesroberthuber.github.io/news-podcast"
 MAX_EPISODES_IN_FEED = 30  # older episodes stay on disk but drop out of the feed
+MAX_CHUNK_BYTES = 4800  # Google's per-request TTS limit is 5000 bytes; stay a bit under it
 
 DOCS_DIR = Path("docs")
 EPISODES_DIR = DOCS_DIR / "episodes"
@@ -79,17 +81,68 @@ def fetch_briefing_text() -> str:
     return exported.decode("utf-8").strip()
 
 
+def _split_into_chunks(text: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[str]:
+    """Splits text into pieces under Google's per-request TTS byte limit.
+
+    Breaks at paragraph boundaries first, falling back to sentence
+    boundaries for any paragraph that's still too long on its own, so
+    the audio doesn't get cut off mid-thought.
+    """
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    def flush():
+        nonlocal current
+        if current:
+            chunks.append(current.strip())
+            current = ""
+
+    for paragraph in paragraphs:
+        candidate = f"{current}\n{paragraph}".strip() if current else paragraph
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            current = candidate
+            continue
+
+        flush()
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+        for sentence in sentences:
+            candidate = f"{current} {sentence}".strip() if current else sentence
+            if len(candidate.encode("utf-8")) <= max_bytes:
+                current = candidate
+            else:
+                flush()
+                current = sentence  # a single sentence over the limit is rare; send as-is
+
+    flush()
+    return chunks
+
+
 def synthesize_audio(text: str, out_path: Path) -> None:
-    """Converts text to an MP3 using a free-tier Google Cloud WaveNet voice."""
+    """Converts text to an MP3 using a free-tier Google Cloud WaveNet voice.
+
+    Google caps each request at 5000 bytes, so longer briefings get split
+    into pieces, synthesized separately, and the resulting audio is joined
+    into one file. Simple concatenation like this can leave a very faint
+    seam between pieces -- usually inaudible for spoken word, but if it's
+    ever noticeable, joining with ffmpeg instead would smooth it out.
+    """
     creds = _load_credentials()
     client = texttospeech.TextToSpeechClient(credentials=creds)
-
-    synthesis_input = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(language_code="en-US", name=VOICE_NAME)
     audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
 
-    response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
-    out_path.write_bytes(response.audio_content)
+    chunks = _split_into_chunks(text)
+    print(f"Synthesizing {len(chunks)} chunk(s)...")
+
+    audio_bytes = b""
+    for i, chunk in enumerate(chunks, 1):
+        synthesis_input = texttospeech.SynthesisInput(text=chunk)
+        response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
+        audio_bytes += response.audio_content
+        print(f"  chunk {i}/{len(chunks)}: {len(chunk)} characters")
+
+    out_path.write_bytes(audio_bytes)
 
 
 def get_duration_seconds(audio_path: Path) -> int | None:
