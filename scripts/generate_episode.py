@@ -1,14 +1,18 @@
 """
-Generates one podcast episode from the day's briefing text.
+Generates one podcast episode, entirely within this job.
 
 What this does, step by step:
-1. Reads the briefing text out of a specific Google Doc (using a service account).
+1. Calls the Anthropic API directly (with web search) to write today's briefing.
 2. Sends that text to Google Cloud Text-to-Speech and saves the result as an MP3.
 3. Adds the new episode to docs/episodes.json (a running log of every episode).
 4. Rebuilds docs/feed.xml from that log -- this is the file podcast apps actually read.
 
+This version writes the briefing itself rather than reading it from a Google Doc,
+so there's no dependency on Claude's scheduled task or your computer being on --
+everything happens inside this one GitHub Actions job, on GitHub's own servers.
+
 The one-time setup this script depends on (Google Cloud project, service account,
-GitHub secrets, etc.) is documented in SETUP.md.
+Anthropic API key, GitHub secrets) is documented in SETUP.md.
 """
 
 import json
@@ -18,8 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+import anthropic
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
 from google.cloud import texttospeech
 from mutagen.mp3 import MP3
 
@@ -31,10 +35,11 @@ SHOW_LANGUAGE = "en-us"
 # Any voice from Google Cloud's free WaveNet tier works here -- browse more at
 # https://cloud.google.com/text-to-speech/docs/voices
 VOICE_NAME = "en-US-Wavenet-D"
-# Fill this in once GitHub Pages is live (Settings -> Pages in your repo).
 SITE_URL = "https://jamesroberthuber.github.io/news-podcast"
 MAX_EPISODES_IN_FEED = 30  # older episodes stay on disk but drop out of the feed
 MAX_CHUNK_BYTES = 4800  # Google's per-request TTS limit is 5000 bytes; stay a bit under it
+CLAUDE_MODEL = "claude-sonnet-5"  # try "claude-haiku-4-5-20251001" for a week and compare quality
+PROMPT_PATH = Path(__file__).parent / "briefing_prompt.txt"
 
 DOCS_DIR = Path("docs")
 EPISODES_DIR = DOCS_DIR / "episodes"
@@ -42,43 +47,26 @@ EPISODES_LOG = DOCS_DIR / "episodes.json"
 FEED_PATH = DOCS_DIR / "feed.xml"
 
 
-def _load_credentials(scopes=None):
-    creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    if scopes:
-        return service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
-    return service_account.Credentials.from_service_account_info(creds_info)
+def generate_briefing_text() -> str:
+    """Asks Claude to research and write today's briefing, using web search.
 
-
-def fetch_briefing_text() -> str:
-    """Finds the most recently created Doc in the shared folder and reads it.
-
-    Claude's Drive connector can create new files but can't edit an existing
-    one in place, so each run creates a fresh Doc rather than overwriting one.
-    This looks up whichever Doc in that folder is newest.
+    This is a single API call -- the web search tool runs on Anthropic's
+    servers, so Claude can search multiple times within this one request
+    before returning the finished script.
     """
-    creds = _load_credentials(scopes=["https://www.googleapis.com/auth/drive.readonly"])
-    drive = build("drive", "v3", credentials=creds)
-    folder_id = os.environ["GOOGLE_DRIVE_FOLDER_ID"]
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    system_prompt = PROMPT_PATH.read_text()
 
-    results = drive.files().list(
-        q=(
-            f"'{folder_id}' in parents "
-            "and mimeType='application/vnd.google-apps.document' "
-            "and trashed=false"
-        ),
-        orderBy="createdTime desc",
-        pageSize=1,
-        fields="files(id, name, createdTime)",
-    ).execute()
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=8000,
+        system=system_prompt,
+        tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 15}],
+        messages=[{"role": "user", "content": "Go"}],
+    )
 
-    files = results.get("files", [])
-    if not files:
-        print("No briefing doc found in the folder today -- skipping.")
-        return ""
-
-    doc_id = files[0]["id"]
-    exported = drive.files().export(fileId=doc_id, mimeType="text/plain").execute()
-    return exported.decode("utf-8").strip()
+    text_blocks = [block.text for block in response.content if block.type == "text"]
+    return "\n\n".join(text_blocks).strip()
 
 
 def _split_into_chunks(text: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[str]:
@@ -118,6 +106,11 @@ def _split_into_chunks(text: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[str]
     return chunks
 
 
+def _load_tts_credentials():
+    creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    return service_account.Credentials.from_service_account_info(creds_info)
+
+
 def synthesize_audio(text: str, out_path: Path) -> None:
     """Converts text to an MP3 using a free-tier Google Cloud WaveNet voice.
 
@@ -127,7 +120,7 @@ def synthesize_audio(text: str, out_path: Path) -> None:
     seam between pieces -- usually inaudible for spoken word, but if it's
     ever noticeable, joining with ffmpeg instead would smooth it out.
     """
-    creds = _load_credentials()
+    creds = _load_tts_credentials()
     client = texttospeech.TextToSpeechClient(credentials=creds)
     voice = texttospeech.VoiceSelectionParams(language_code="en-US", name=VOICE_NAME)
     audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
@@ -220,30 +213,10 @@ def build_feed_xml(episodes: list) -> str:
 def main() -> None:
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
 
-    text = fetch_briefing_text()
+    text = generate_briefing_text()
     if not text:
-        print("No briefing text found today -- skipping.")
+        print("Claude returned no briefing text today -- skipping.")
         return
 
-    today = datetime.now(timezone.utc)
-    filename = f"{today:%Y-%m-%d}.mp3"
-    audio_path = EPISODES_DIR / filename
-    synthesize_audio(text, audio_path)
-    duration_seconds = get_duration_seconds(audio_path)
-
-    episodes = load_episode_log()
-    episodes = upsert_episode(episodes, {
-        "title": f"Briefing -- {today:%B %-d, %Y}",
-        "pub_date": today.strftime("%a, %d %b %Y %H:%M:%S +0000"),
-        "filename": filename,
-        "file_size": audio_path.stat().st_size,
-        "duration_seconds": duration_seconds,
-    })
-    save_episode_log(episodes)
-
-    FEED_PATH.write_text(build_feed_xml(episodes))
-    print(f"Published episode: {filename}")
-
-
-if __name__ == "__main__":
-    main()
+    today =
+    
