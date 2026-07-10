@@ -11,16 +11,10 @@
     
     <item>
       <title>Briefing -- July 10, 2026</title>
-      <pubDate>Fri, 10 Jul 2026 03:41:05 +0000</pubDate>
+      <pubDate>Fri, 10 Jul 2026 03:56:20 +0000</pubDate>
       <guid isPermaLink="false">2026-07-10.mp3</guid>
       <enclosure url="https://jamesroberthuber.github.io/news-podcast/episodes/2026-07-10.mp3" type="audio/mpeg" length="302976" />
-      <description>Briefing -- July 10, 2026</description>
-    </item>
-    <item>
-      <title>Briefing -- July 10, 2026</title>
-      <pubDate>Fri, 10 Jul 2026 02:30:22 +0000</pubDate>
-      <guid isPermaLink="false">2026-07-10.mp3</guid>
-      <enclosure url="https://jamesroberthuber.github.io/news-podcast/episodes/2026-07-10.mp3" type="audio/mpeg" length="2304" />
+      <itunes:duration>38</itunes:duration>
       <description>Briefing -- July 10, 2026</description>
     </item>
   </channel>
