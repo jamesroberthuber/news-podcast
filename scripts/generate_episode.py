@@ -20,6 +20,7 @@ from xml.sax.saxutils import escape
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from google.cloud import texttospeech
+from mutagen.mp3 import MP3
 
 # ---- Things you'll likely want to change ----
 SHOW_TITLE = "James's Morning Briefing"
@@ -91,6 +92,35 @@ def synthesize_audio(text: str, out_path: Path) -> None:
     out_path.write_bytes(response.audio_content)
 
 
+def get_duration_seconds(audio_path: Path) -> int | None:
+    """Reads the real length off the MP3 so the feed can report it accurately.
+
+    Without this, podcast apps have to guess the duration themselves, and
+    some (Apple Podcasts included) show 0:00 and mark the episode as
+    instantly finished rather than actually playing it.
+    """
+    try:
+        return round(MP3(str(audio_path)).info.length)
+    except Exception as exc:  # don't let a metadata hiccup break the whole run
+        print(f"Could not read duration: {exc}")
+        return None
+
+
+def upsert_episode(episodes: list, new_episode: dict) -> list:
+    """Adds an episode, replacing any existing entry for the same file.
+
+    The workflow can run more than once on the same day -- a manual test,
+    a retry after a failure -- and since the filename is date-based, a
+    second run would otherwise add a second entry with the same guid as
+    the first. Duplicate guids in a feed confuse podcast apps rather than
+    just producing an extra episode, so this keeps exactly one entry per
+    filename, always reflecting the most recent run.
+    """
+    episodes = [ep for ep in episodes if ep["filename"] != new_episode["filename"]]
+    episodes.append(new_episode)
+    return episodes
+
+
 def load_episode_log() -> list:
     if EPISODES_LOG.exists():
         return json.loads(EPISODES_LOG.read_text())
@@ -106,12 +136,14 @@ def build_feed_xml(episodes: list) -> str:
     items = []
     for ep in reversed(episodes[-MAX_EPISODES_IN_FEED:]):
         audio_url = f"{SITE_URL}/episodes/{ep['filename']}"
+        duration = ep.get("duration_seconds")
+        duration_tag = f"\n      <itunes:duration>{duration}</itunes:duration>" if duration else ""
         items.append(f"""
     <item>
       <title>{escape(ep['title'])}</title>
       <pubDate>{ep['pub_date']}</pubDate>
       <guid isPermaLink="false">{ep['filename']}</guid>
-      <enclosure url="{audio_url}" type="audio/mpeg" length="{ep['file_size']}" />
+      <enclosure url="{audio_url}" type="audio/mpeg" length="{ep['file_size']}" />{duration_tag}
       <description>{escape(ep['title'])}</description>
     </item>""")
 
@@ -143,13 +175,15 @@ def main() -> None:
     filename = f"{today:%Y-%m-%d}.mp3"
     audio_path = EPISODES_DIR / filename
     synthesize_audio(text, audio_path)
+    duration_seconds = get_duration_seconds(audio_path)
 
     episodes = load_episode_log()
-    episodes.append({
+    episodes = upsert_episode(episodes, {
         "title": f"Briefing -- {today:%B %-d, %Y}",
         "pub_date": today.strftime("%a, %d %b %Y %H:%M:%S +0000"),
         "filename": filename,
         "file_size": audio_path.stat().st_size,
+        "duration_seconds": duration_seconds,
     })
     save_episode_log(episodes)
 
