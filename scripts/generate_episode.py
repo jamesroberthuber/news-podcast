@@ -218,5 +218,25 @@ def main() -> None:
         print("Claude returned no briefing text today -- skipping.")
         return
 
-    today =
-    
+    today = datetime.now(timezone.utc)
+    filename = f"{today:%Y-%m-%d}.mp3"
+    audio_path = EPISODES_DIR / filename
+    synthesize_audio(text, audio_path)
+    duration_seconds = get_duration_seconds(audio_path)
+
+    episodes = load_episode_log()
+    episodes = upsert_episode(episodes, {
+        "title": f"Briefing -- {today:%B %-d, %Y}",
+        "pub_date": today.strftime("%a, %d %b %Y %H:%M:%S +0000"),
+        "filename": filename,
+        "file_size": audio_path.stat().st_size,
+        "duration_seconds": duration_seconds,
+    })
+    save_episode_log(episodes)
+
+    FEED_PATH.write_text(build_feed_xml(episodes))
+    print(f"Published episode: {filename}")
+
+
+if __name__ == "__main__":
+    main()
