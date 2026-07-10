@@ -210,6 +210,7 @@ def build_feed_xml(episodes: list) -> str:
     <itunes:author>{escape(SHOW_AUTHOR)}</itunes:author>
     <itunes:explicit>false</itunes:explicit>
     <itunes:category text="News" />
+    <itunes:image href="{SITE_URL}/artwork.jpg" />
     {''.join(items)}
   </channel>
 </rss>
