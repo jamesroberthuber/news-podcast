@@ -30,7 +30,7 @@ SHOW_LANGUAGE = "en-us"
 # https://cloud.google.com/text-to-speech/docs/voices
 VOICE_NAME = "en-US-Wavenet-D"
 # Fill this in once GitHub Pages is live (Settings -> Pages in your repo).
-SITE_URL = "https://YOUR-USERNAME.github.io/YOUR-REPO-NAME"
+SITE_URL = "https://jamesroberthuber.github.io/news-podcast"
 MAX_EPISODES_IN_FEED = 30  # older episodes stay on disk but drop out of the feed
 
 DOCS_DIR = Path("docs")
