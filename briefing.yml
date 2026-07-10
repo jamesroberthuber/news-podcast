@@ -1,0 +1,42 @@
+name: Generate daily briefing episode
+
+on:
+  schedule:
+    # 6:52am Pacific, weekdays. An off-minute (not :00 or :30) keeps this
+    # out of GitHub's busiest scheduling windows, so it fires closer to on time.
+    # Pacific shifts between PST/PDT across the year -- if you notice the
+    # actual run time drift by an hour after a time change, adjust this.
+    - cron: '52 13 * * 1-5'
+  workflow_dispatch: {}   # adds a "Run workflow" button in the Actions tab, for manual testing
+
+permissions:
+  contents: write   # the job needs to commit the new episode back into the repo
+
+jobs:
+  build-episode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate today's episode
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DOC_ID: ${{ secrets.GOOGLE_DOC_ID }}
+        run: python scripts/generate_episode.py
+
+      - name: Commit and push the new episode
+        run: |
+          git config user.name "briefing-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs/
+          git diff --quiet --cached || git commit -m "Add episode for $(date -u +%Y-%m-%d)"
+          git push
