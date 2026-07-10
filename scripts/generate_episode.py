@@ -47,10 +47,33 @@ def _load_credentials(scopes=None):
 
 
 def fetch_briefing_text() -> str:
-    """Pulls today's briefing text out of the Google Doc Claude wrote it to."""
+    """Finds the most recently created Doc in the shared folder and reads it.
+
+    Claude's Drive connector can create new files but can't edit an existing
+    one in place, so each run creates a fresh Doc rather than overwriting one.
+    This looks up whichever Doc in that folder is newest.
+    """
     creds = _load_credentials(scopes=["https://www.googleapis.com/auth/drive.readonly"])
     drive = build("drive", "v3", credentials=creds)
-    doc_id = os.environ["GOOGLE_DOC_ID"]
+    folder_id = os.environ["GOOGLE_DRIVE_FOLDER_ID"]
+
+    results = drive.files().list(
+        q=(
+            f"'{folder_id}' in parents "
+            "and mimeType='application/vnd.google-apps.document' "
+            "and trashed=false"
+        ),
+        orderBy="createdTime desc",
+        pageSize=1,
+        fields="files(id, name, createdTime)",
+    ).execute()
+
+    files = results.get("files", [])
+    if not files:
+        print("No briefing doc found in the folder today -- skipping.")
+        return ""
+
+    doc_id = files[0]["id"]
     exported = drive.files().export(fileId=doc_id, mimeType="text/plain").execute()
     return exported.decode("utf-8").strip()
 
