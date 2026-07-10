@@ -34,7 +34,7 @@ SHOW_AUTHOR = "James"
 SHOW_LANGUAGE = "en-us"
 # Any voice from Google Cloud's free WaveNet tier works here -- browse more at
 # https://cloud.google.com/text-to-speech/docs/voices
-VOICE_NAME = "en-US-Wavenet-D"
+VOICE_NAME = "en-US-Studio-O"
 SITE_URL = "https://jamesroberthuber.github.io/news-podcast"
 MAX_EPISODES_IN_FEED = 30  # older episodes stay on disk but drop out of the feed
 MAX_CHUNK_BYTES = 4800  # Google's per-request TTS limit is 5000 bytes; stay a bit under it
