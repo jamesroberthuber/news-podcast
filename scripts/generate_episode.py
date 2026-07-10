@@ -59,14 +59,19 @@ def generate_briefing_text() -> str:
 
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=8000,
+        max_tokens=16000,
         system=system_prompt,
         tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 15}],
         messages=[{"role": "user", "content": "Go"}],
     )
 
+    if response.stop_reason == "max_tokens":
+        print("WARNING: response hit the max_tokens limit -- the briefing may be truncated.")
+
     text_blocks = [block.text for block in response.content if block.type == "text"]
-    return "\n\n".join(text_blocks).strip()
+    text = "\n\n".join(text_blocks).strip()
+    print(f"Generated {len(text)} characters (stop_reason: {response.stop_reason})")
+    return text
 
 
 def _split_into_chunks(text: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[str]:
