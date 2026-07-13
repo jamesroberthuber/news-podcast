@@ -11,6 +11,14 @@
     <itunes:image href="https://jamesroberthuber.github.io/news-podcast/artwork.jpg" />
     
     <item>
+      <title>Briefing -- July 13, 2026</title>
+      <pubDate>Mon, 13 Jul 2026 16:19:31 +0000</pubDate>
+      <guid isPermaLink="false">2026-07-13.mp3</guid>
+      <enclosure url="https://jamesroberthuber.github.io/news-podcast/episodes/2026-07-13.mp3" type="audio/mpeg" length="2167104" />
+      <itunes:duration>271</itunes:duration>
+      <description>Briefing -- July 13, 2026</description>
+    </item>
+    <item>
       <title>Briefing -- July 12, 2026</title>
       <pubDate>Sun, 12 Jul 2026 14:47:46 +0000</pubDate>
       <guid isPermaLink="false">2026-07-12.mp3</guid>
