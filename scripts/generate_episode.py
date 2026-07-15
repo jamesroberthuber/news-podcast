@@ -37,7 +37,8 @@ SHOW_LANGUAGE = "en-us"
 VOICE_NAME = "en-US-Studio-O"
 SITE_URL = "https://jamesroberthuber.github.io/news-podcast"
 MAX_EPISODES_IN_FEED = 30  # older episodes stay on disk but drop out of the feed
-MAX_CHUNK_BYTES = 4800  # Google's per-request TTS limit is 5000 bytes; stay a bit under it
+MAX_CHUNK_BYTES = 4300  # Google's per-request TTS limit is 5000 bytes; leaves room for the
+                        # <speak>/<break> SSML tags added around each chunk before sending
 CLAUDE_MODEL = "claude-sonnet-5"  # try "claude-haiku-4-5-20251001" for a week and compare quality
 PROMPT_PATH = Path(__file__).parent / "briefing_prompt.txt"
 
@@ -68,10 +69,44 @@ def generate_briefing_text() -> str:
     if response.stop_reason == "max_tokens":
         print("WARNING: response hit the max_tokens limit -- the briefing may be truncated.")
 
+    # Claude's response can include text blocks written between web searches (e.g. "let me
+    # check one more source") alongside the actual finished script. Only the last text block
+    # is the complete briefing -- earlier ones are dropped so stray narration never reaches
+    # the audio, even if Claude ignores the "no narration" instruction in the prompt.
     text_blocks = [block.text for block in response.content if block.type == "text"]
-    text = "\n\n".join(text_blocks).strip()
+    if len(text_blocks) > 1:
+        print(f"WARNING: got {len(text_blocks)} text blocks -- dropping all but the last one. Dropped blocks:")
+        for block in text_blocks[:-1]:
+            print(f"  DROPPED: {block[:200]!r}")
+
+    text = text_blocks[-1].strip() if text_blocks else ""
     print(f"Generated {len(text)} characters (stop_reason: {response.stop_reason})")
     return text
+
+
+def _sanitize_for_speech(text: str) -> str:
+    """Strips markdown/decorative characters that Google TTS reads aloud literally.
+
+    Claude sometimes separates sections with a horizontal-rule-style line (---, ***, ...),
+    a bullet marker, or markdown emphasis (**bold**) even when told to write plain prose.
+    Google's Studio voices don't silently skip these -- a lone separator character between
+    sections gets vocalized (e.g. as "dot"), which is audible and jarring in a podcast.
+    """
+    lines = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        # Drop separator-only lines: ---, ***, ..., •••, or any mix of those characters.
+        if stripped and re.fullmatch(r"[-*_.•●▪‣~=]+", stripped):
+            continue
+        # Strip a leading list-bullet marker but keep the rest of the line's content.
+        stripped = re.sub(r"^[-*•●▪‣]\s+", "", stripped)
+        # Remove markdown emphasis markers -- they're never meant to be read aloud.
+        stripped = re.sub(r"(\*\*|__|\*|_)", "", stripped)
+        lines.append(stripped)
+
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)  # collapse blank runs left by removed separators
+    return text.strip()
 
 
 def _split_into_chunks(text: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[str]:
@@ -116,8 +151,24 @@ def _load_tts_credentials():
     return service_account.Credentials.from_service_account_info(creds_info)
 
 
+SECTION_PAUSE_MS = 700  # silence inserted between paragraphs/sections so they don't blur together
+
+
+def _to_ssml(chunk: str) -> str:
+    """Wraps a chunk in SSML, inserting a deliberate pause between each paragraph.
+
+    Plain-text synthesis relies on Claude's punctuation alone for pacing, which reads
+    as one continuous stream with no sense of moving from one story to the next. Each
+    paragraph in the briefing is one story/section (see _split_into_chunks), so a pause
+    at every paragraph boundary gives the listener an audible break between sections.
+    """
+    paragraphs = [p for p in chunk.split("\n") if p.strip()]
+    body = f'<break time="{SECTION_PAUSE_MS}ms"/>'.join(escape(p) for p in paragraphs)
+    return f"<speak>{body}</speak>"
+
+
 def synthesize_audio(text: str, out_path: Path) -> None:
-    """Converts text to an MP3 using a free-tier Google Cloud WaveNet voice.
+    """Converts text to an MP3 using a Google Cloud voice, with pauses between sections.
 
     Google caps each request at 5000 bytes, so longer briefings get split
     into pieces, synthesized separately, and the resulting audio is joined
@@ -135,7 +186,7 @@ def synthesize_audio(text: str, out_path: Path) -> None:
 
     audio_bytes = b""
     for i, chunk in enumerate(chunks, 1):
-        synthesis_input = texttospeech.SynthesisInput(text=chunk)
+        synthesis_input = texttospeech.SynthesisInput(ssml=_to_ssml(chunk))
         response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
         audio_bytes += response.audio_content
         print(f"  chunk {i}/{len(chunks)}: {len(chunk)} characters")
@@ -222,10 +273,17 @@ def main() -> None:
     if not text:
         print("Claude returned no briefing text today -- skipping.")
         return
+    text = _sanitize_for_speech(text)
 
     today = datetime.now(timezone.utc)
     filename = f"{today:%Y-%m-%d}.mp3"
     audio_path = EPISODES_DIR / filename
+
+    # Saved alongside the audio so the generated script can be inspected directly,
+    # instead of only being able to listen to the synthesized result.
+    text_path = EPISODES_DIR / f"{today:%Y-%m-%d}.txt"
+    text_path.write_text(text)
+
     synthesize_audio(text, audio_path)
     duration_seconds = get_duration_seconds(audio_path)
 
