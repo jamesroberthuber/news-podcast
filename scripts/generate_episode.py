@@ -69,17 +69,18 @@ def generate_briefing_text() -> str:
     if response.stop_reason == "max_tokens":
         print("WARNING: response hit the max_tokens limit -- the briefing may be truncated.")
 
-    # Claude's response can include text blocks written between web searches (e.g. "let me
-    # check one more source") alongside the actual finished script. Only the last text block
-    # is the complete briefing -- earlier ones are dropped so stray narration never reaches
-    # the audio, even if Claude ignores the "no narration" instruction in the prompt.
+    # A web search can happen in the middle of writing the script, not just before it --
+    # when that happens, Claude's response splits the *finished* briefing itself across
+    # multiple text blocks (one before the search, one after), so all of them must be
+    # joined to get the full script. (An earlier version of this code kept only the last
+    # block to guard against stray narration like "let me check one more source" -- but
+    # that silently dropped the opening of the briefing whenever a search landed mid-script,
+    # producing a truncated episode. Narration leaks are now prevented at the prompt level.)
     text_blocks = [block.text for block in response.content if block.type == "text"]
     if len(text_blocks) > 1:
-        print(f"WARNING: got {len(text_blocks)} text blocks -- dropping all but the last one. Dropped blocks:")
-        for block in text_blocks[:-1]:
-            print(f"  DROPPED: {block[:200]!r}")
+        print(f"Got {len(text_blocks)} text blocks (likely from a mid-script search) -- joining them.")
 
-    text = text_blocks[-1].strip() if text_blocks else ""
+    text = "\n\n".join(text_blocks).strip()
     print(f"Generated {len(text)} characters (stop_reason: {response.stop_reason})")
     return text
 
