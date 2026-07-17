@@ -69,17 +69,17 @@ def generate_briefing_text() -> str:
     if response.stop_reason == "max_tokens":
         print("WARNING: response hit the max_tokens limit -- the briefing may be truncated.")
 
-    # Claude's response can include text blocks written between web searches (e.g. "let me
-    # check one more source") alongside the actual finished script. Only the last text block
-    # is the complete briefing -- earlier ones are dropped so stray narration never reaches
-    # the audio, even if Claude ignores the "no narration" instruction in the prompt.
+    # Web search runs server-side mid-response, so Claude's script is naturally split into
+    # multiple text blocks wherever a search interrupts generation -- often mid-sentence.
+    # These are fragments of one continuous stream, not separate narration turns, so they
+    # must be reassembled in order with no separator (a prior version kept only the last
+    # block on the theory that earlier ones were stray narration like "let me check one
+    # more source" -- that dropped real briefing content and produced truncated episodes).
     text_blocks = [block.text for block in response.content if block.type == "text"]
     if len(text_blocks) > 1:
-        print(f"WARNING: got {len(text_blocks)} text blocks -- dropping all but the last one. Dropped blocks:")
-        for block in text_blocks[:-1]:
-            print(f"  DROPPED: {block[:200]!r}")
+        print(f"Got {len(text_blocks)} text blocks (split by interleaved web searches) -- joining them.")
 
-    text = text_blocks[-1].strip() if text_blocks else ""
+    text = "".join(text_blocks).strip()
     print(f"Generated {len(text)} characters (stop_reason: {response.stop_reason})")
     return text
 
