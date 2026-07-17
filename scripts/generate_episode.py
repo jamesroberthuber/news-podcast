@@ -15,14 +15,18 @@ The one-time setup this script depends on (Google Cloud project, service account
 Anthropic API key, GitHub secrets) is documented in SETUP.md.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
 import anthropic
+from google.api_core import exceptions as google_exceptions
 from google.oauth2 import service_account
 from google.cloud import texttospeech
 from mutagen.mp3 import MP3
@@ -37,10 +41,27 @@ SHOW_LANGUAGE = "en-us"
 VOICE_NAME = "en-US-Studio-O"
 SITE_URL = "https://jamesroberthuber.github.io/news-podcast"
 MAX_EPISODES_IN_FEED = 30  # older episodes stay on disk but drop out of the feed
-MAX_CHUNK_BYTES = 4300  # Google's per-request TTS limit is 5000 bytes; leaves room for the
-                        # <speak>/<break> SSML tags added around each chunk before sending
+# Google caps each TTS request at 5000 bytes, measured on the rendered SSML payload -- which
+# includes the <speak>/<break> tags and &amp;-style entity escapes, so it's larger than the raw
+# text. Budget chunks against the actual SSML size, with headroom below the hard limit.
+SSML_HARD_LIMIT_BYTES = 5000
+MAX_SSML_BYTES = 4800
 CLAUDE_MODEL = "claude-sonnet-5"  # try "claude-haiku-4-5-20251001" for a week and compare quality
 PROMPT_PATH = Path(__file__).parent / "briefing_prompt.txt"
+
+# Guardrails. A real ~5-minute briefing is several thousand characters and a couple of minutes
+# of audio; anything well below these floors means generation or synthesis went wrong. The
+# workflow only commits when this script exits zero, so raising on a bad result means a broken
+# episode surfaces as a red Actions run instead of a silently published 4-second clip.
+MIN_BRIEFING_CHARS = 1500
+MIN_DURATION_SECONDS = 90
+MIN_AUDIO_BYTES = 20_000
+MAX_TOKENS = 16000
+
+# The server-side web-search loop can pause mid-generation (stop_reason "pause_turn"); resume
+# the same turn up to this many times before giving up rather than shipping a partial briefing.
+MAX_PAUSE_CONTINUATIONS = 6
+API_RETRY_ATTEMPTS = 4  # transient-error retries for both the Anthropic and Google TTS calls
 
 DOCS_DIR = Path("docs")
 EPISODES_DIR = DOCS_DIR / "episodes"
@@ -48,39 +69,66 @@ EPISODES_LOG = DOCS_DIR / "episodes.json"
 FEED_PATH = DOCS_DIR / "feed.xml"
 
 
+def _assistant_text(content) -> list[str]:
+    """Pulls the text fragments out of one assistant turn's content blocks.
+
+    Web search runs server-side mid-response, so a single turn's `content` interleaves
+    text blocks with server_tool_use / web_search_tool_result blocks. The text blocks are
+    fragments of one continuous stream (a search can split even a single sentence), so the
+    caller joins them with no separator. We keep only `text` blocks and drop the tool blocks.
+    """
+    return [block.text for block in content if block.type == "text"]
+
+
 def generate_briefing_text() -> str:
     """Asks Claude to research and write today's briefing, using web search.
 
-    This is a single API call -- the web search tool runs on Anthropic's
-    servers, so Claude can search multiple times within this one request
-    before returning the finished script.
+    The web search tool runs on Anthropic's servers, so Claude searches several times within
+    the turn before writing the script. If that server-side loop hits its iteration cap the
+    turn stops with stop_reason "pause_turn" and must be resumed -- otherwise the briefing is
+    silently truncated. We resume until the turn ends normally, accumulating text across every
+    turn, and treat any non-`end_turn` stop reason (max_tokens, refusal, ...) as a hard failure
+    so a partial briefing fails the job rather than being published.
     """
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    system_prompt = PROMPT_PATH.read_text()
-
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=16000,
-        system=system_prompt,
-        tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 15}],
-        messages=[{"role": "user", "content": "Go"}],
+    client = anthropic.Anthropic(
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        max_retries=API_RETRY_ATTEMPTS,  # SDK retries 429/5xx/connection errors with backoff
     )
+    system_prompt = PROMPT_PATH.read_text()
+    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 15}]
+    messages = [{"role": "user", "content": "Go"}]
 
-    if response.stop_reason == "max_tokens":
-        print("WARNING: response hit the max_tokens limit -- the briefing may be truncated.")
+    text_fragments: list[str] = []
+    for attempt in range(MAX_PAUSE_CONTINUATIONS):
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=MAX_TOKENS,
+            system=system_prompt,
+            tools=tools,
+            messages=messages,
+        )
+        text_fragments += _assistant_text(response.content)
 
-    # Web search runs server-side mid-response, so Claude's script is naturally split into
-    # multiple text blocks wherever a search interrupts generation -- often mid-sentence.
-    # These are fragments of one continuous stream, not separate narration turns, so they
-    # must be reassembled in order with no separator (a prior version kept only the last
-    # block on the theory that earlier ones were stray narration like "let me check one
-    # more source" -- that dropped real briefing content and produced truncated episodes).
-    text_blocks = [block.text for block in response.content if block.type == "text"]
-    if len(text_blocks) > 1:
-        print(f"Got {len(text_blocks)} text blocks (split by interleaved web searches) -- joining them.")
+        if response.stop_reason == "pause_turn":
+            # Server-side tool loop paused mid-generation. Feed the partial turn back so the
+            # next request resumes exactly where it left off (do NOT add a "continue" message).
+            messages.append({"role": "assistant", "content": response.content})
+            print(f"Turn paused (attempt {attempt + 1}); resuming to finish the briefing.")
+            continue
 
-    text = "".join(text_blocks).strip()
-    print(f"Generated {len(text)} characters (stop_reason: {response.stop_reason})")
+        if response.stop_reason != "end_turn":
+            raise SystemExit(
+                f"Briefing generation stopped with stop_reason {response.stop_reason!r} "
+                f"-- refusing to publish a partial or refused briefing."
+            )
+        break
+    else:
+        raise SystemExit(
+            f"Briefing still pausing after {MAX_PAUSE_CONTINUATIONS} continuations -- aborting."
+        )
+
+    text = "".join(text_fragments).strip()
+    print(f"Generated {len(text)} characters across {len(text_fragments)} text block(s).")
     return text
 
 
@@ -95,8 +143,8 @@ def _sanitize_for_speech(text: str) -> str:
     lines = []
     for line in text.split("\n"):
         stripped = line.strip()
-        # Drop separator-only lines: ---, ***, ..., •••, or any mix of those characters.
-        if stripped and re.fullmatch(r"[-*_.•●▪‣~=]+", stripped):
+        # Drop separator-only lines: ---, ***, ..., •••, em/en-dash rules, or any mix.
+        if stripped and re.fullmatch(r"[-–—*_.•●▪‣~=]+", stripped):
             continue
         # Strip a leading list-bullet marker but keep the rest of the line's content.
         stripped = re.sub(r"^[-*•●▪‣]\s+", "", stripped)
@@ -109,13 +157,17 @@ def _sanitize_for_speech(text: str) -> str:
     return text.strip()
 
 
-def _split_into_chunks(text: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[str]:
-    """Splits text into pieces under Google's per-request TTS byte limit.
+def _split_into_chunks(text: str, max_ssml_bytes: int = MAX_SSML_BYTES) -> list[str]:
+    """Splits text into pieces that stay under Google's per-request TTS byte limit.
 
-    Breaks at paragraph boundaries first, falling back to sentence
-    boundaries for any paragraph that's still too long on its own, so
-    the audio doesn't get cut off mid-thought.
+    The limit is measured on the rendered SSML, not the raw text, so each candidate is sized
+    via `_to_ssml` (which adds the <speak>/<break> tags and entity escapes). Breaks at
+    paragraph boundaries first, falling back to sentence boundaries for any paragraph that's
+    still too long on its own, so the audio doesn't get cut off mid-thought.
     """
+    def fits(candidate: str) -> bool:
+        return len(_to_ssml(candidate).encode("utf-8")) <= max_ssml_bytes
+
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
     chunks: list[str] = []
     current = ""
@@ -128,7 +180,7 @@ def _split_into_chunks(text: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[str]
 
     for paragraph in paragraphs:
         candidate = f"{current}\n{paragraph}".strip() if current else paragraph
-        if len(candidate.encode("utf-8")) <= max_bytes:
+        if fits(candidate):
             current = candidate
             continue
 
@@ -136,7 +188,7 @@ def _split_into_chunks(text: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[str]
         sentences = re.split(r"(?<=[.!?])\s+", paragraph)
         for sentence in sentences:
             candidate = f"{current} {sentence}".strip() if current else sentence
-            if len(candidate.encode("utf-8")) <= max_bytes:
+            if fits(candidate):
                 current = candidate
             else:
                 flush()
@@ -167,6 +219,33 @@ def _to_ssml(chunk: str) -> str:
     return f"<speak>{body}</speak>"
 
 
+# Transient Google API errors worth retrying (rate limits, 5xx, timeouts). A 400
+# (InvalidArgument -- e.g. an oversized SSML chunk) is a real bug, so it's deliberately not
+# listed here: it propagates and fails the job loudly rather than being retried pointlessly.
+_RETRYABLE_TTS_ERRORS = (
+    google_exceptions.ResourceExhausted,
+    google_exceptions.ServiceUnavailable,
+    google_exceptions.DeadlineExceeded,
+    google_exceptions.InternalServerError,
+    google_exceptions.GatewayTimeout,
+)
+
+
+def _synthesize_chunk(client, synthesis_input, voice, audio_config):
+    """One TTS request, retried on transient errors with exponential backoff."""
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            return client.synthesize_speech(
+                input=synthesis_input, voice=voice, audio_config=audio_config
+            )
+        except _RETRYABLE_TTS_ERRORS as exc:
+            if attempt == API_RETRY_ATTEMPTS - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"    TTS request failed ({exc.__class__.__name__}); retrying in {wait}s")
+            time.sleep(wait)
+
+
 def synthesize_audio(text: str, out_path: Path) -> None:
     """Converts text to an MP3 using a Google Cloud voice, with pauses between sections.
 
@@ -175,6 +254,10 @@ def synthesize_audio(text: str, out_path: Path) -> None:
     into one file. Simple concatenation like this can leave a very faint
     seam between pieces -- usually inaudible for spoken word, but if it's
     ever noticeable, joining with ffmpeg instead would smooth it out.
+
+    Raises SystemExit if any chunk would exceed Google's SSML limit, a chunk comes back
+    with no audio, or the joined result is implausibly small -- so a broken synthesis fails
+    the job instead of publishing a silent or truncated episode.
     """
     creds = _load_tts_credentials()
     client = texttospeech.TextToSpeechClient(credentials=creds)
@@ -186,10 +269,25 @@ def synthesize_audio(text: str, out_path: Path) -> None:
 
     audio_bytes = b""
     for i, chunk in enumerate(chunks, 1):
-        synthesis_input = texttospeech.SynthesisInput(ssml=_to_ssml(chunk))
-        response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
+        ssml = _to_ssml(chunk)
+        ssml_bytes = len(ssml.encode("utf-8"))
+        if ssml_bytes > SSML_HARD_LIMIT_BYTES:
+            raise SystemExit(
+                f"SSML chunk {i} is {ssml_bytes} bytes, over Google's {SSML_HARD_LIMIT_BYTES}-byte "
+                f"limit -- tighten chunking (a single over-long sentence can cause this)."
+            )
+        synthesis_input = texttospeech.SynthesisInput(ssml=ssml)
+        response = _synthesize_chunk(client, synthesis_input, voice, audio_config)
+        if not response.audio_content:
+            raise SystemExit(f"TTS returned empty audio for chunk {i} -- refusing to publish.")
         audio_bytes += response.audio_content
-        print(f"  chunk {i}/{len(chunks)}: {len(chunk)} characters")
+        print(f"  chunk {i}/{len(chunks)}: {len(chunk)} chars, {ssml_bytes} SSML bytes")
+
+    if len(audio_bytes) < MIN_AUDIO_BYTES:
+        raise SystemExit(
+            f"Synthesized audio is only {len(audio_bytes)} bytes (min {MIN_AUDIO_BYTES}) "
+            f"-- something went wrong; refusing to publish."
+        )
 
     out_path.write_bytes(audio_bytes)
 
@@ -237,16 +335,24 @@ def build_feed_xml(episodes: list) -> str:
     """Rebuilds the whole RSS feed from the episode log, newest episode first."""
     items = []
     for ep in reversed(episodes[-MAX_EPISODES_IN_FEED:]):
-        audio_url = f"{SITE_URL}/episodes/{ep['filename']}"
+        filename = ep.get("filename")
+        file_size = ep.get("file_size")
+        if not filename or not file_size:
+            # A malformed/legacy log entry shouldn't abort the whole feed rebuild after the
+            # new audio is already on disk -- skip it rather than raising KeyError.
+            print(f"Skipping malformed episode-log entry: {ep!r}")
+            continue
+        title = ep.get("title", filename)
+        audio_url = f"{SITE_URL}/episodes/{filename}"
         duration = ep.get("duration_seconds")
         duration_tag = f"\n      <itunes:duration>{duration}</itunes:duration>" if duration else ""
         items.append(f"""
     <item>
-      <title>{escape(ep['title'])}</title>
-      <pubDate>{ep['pub_date']}</pubDate>
-      <guid isPermaLink="false">{ep['filename']}</guid>
-      <enclosure url="{audio_url}" type="audio/mpeg" length="{ep['file_size']}" />{duration_tag}
-      <description>{escape(ep['title'])}</description>
+      <title>{escape(title)}</title>
+      <pubDate>{ep.get('pub_date', '')}</pubDate>
+      <guid isPermaLink="false">{filename}</guid>
+      <enclosure url="{audio_url}" type="audio/mpeg" length="{file_size}" />{duration_tag}
+      <description>{escape(title)}</description>
     </item>""")
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -269,11 +375,12 @@ def build_feed_xml(episodes: list) -> str:
 def main() -> None:
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
 
-    text = generate_briefing_text()
-    if not text:
-        print("Claude returned no briefing text today -- skipping.")
-        return
-    text = _sanitize_for_speech(text)
+    text = _sanitize_for_speech(generate_briefing_text())
+    if len(text) < MIN_BRIEFING_CHARS:
+        raise SystemExit(
+            f"Briefing is only {len(text)} chars (min {MIN_BRIEFING_CHARS}) -- refusing to "
+            f"publish. Likely a failed search, an empty response, or a refusal."
+        )
 
     today = datetime.now(timezone.utc)
     filename = f"{today:%Y-%m-%d}.mp3"
@@ -285,7 +392,13 @@ def main() -> None:
     text_path.write_text(text)
 
     synthesize_audio(text, audio_path)
+
     duration_seconds = get_duration_seconds(audio_path)
+    if duration_seconds is None or duration_seconds < MIN_DURATION_SECONDS:
+        raise SystemExit(
+            f"Episode duration {duration_seconds}s is below the {MIN_DURATION_SECONDS}s floor "
+            f"-- refusing to publish a truncated or empty episode."
+        )
 
     episodes = load_episode_log()
     episodes = upsert_episode(episodes, {
