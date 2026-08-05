@@ -138,5 +138,12 @@
     "filename": "2026-08-04.mp3",
     "file_size": 1025472,
     "duration_seconds": 128
+  },
+  {
+    "title": "Briefing -- August 5, 2026",
+    "pub_date": "Wed, 05 Aug 2026 12:37:43 +0000",
+    "filename": "2026-08-05.mp3",
+    "file_size": 2026944,
+    "duration_seconds": 253
   }
 ]
