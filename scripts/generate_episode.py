@@ -46,7 +46,8 @@ MAX_EPISODES_IN_FEED = 30  # older episodes stay on disk but drop out of the fee
 # text. Budget chunks against the actual SSML size, with headroom below the hard limit.
 SSML_HARD_LIMIT_BYTES = 5000
 MAX_SSML_BYTES = 4800
-CLAUDE_MODEL = "claude-sonnet-5"  # try "claude-haiku-4-5-20251001" for a week and compare quality
+CLAUDE_MODEL = "claude-haiku-4-5"  # cheaper than Sonnet 5; no output_config.effort knob -- Haiku doesn't support it
+MAX_WEB_SEARCHES = 8  # lower search cap -> less chance of hitting the server-side pause_turn wall
 PROMPT_PATH = Path(__file__).parent / "briefing_prompt.txt"
 
 # Guardrails. A real ~5-minute briefing is several thousand characters and a couple of minutes
@@ -60,7 +61,10 @@ MAX_TOKENS = 16000
 
 # The server-side web-search loop can pause mid-generation (stop_reason "pause_turn"); resume
 # the same turn up to this many times before giving up rather than shipping a partial briefing.
-MAX_PAUSE_CONTINUATIONS = 6
+# Kept low because every resend re-bills the whole accumulated conversation -- a run that needs
+# many continuations is exactly the runaway-cost case, so failing fast here is cheaper than
+# letting it grind through six rounds. A skipped episode is fine; a $2+ episode isn't.
+MAX_PAUSE_CONTINUATIONS = 3
 API_RETRY_ATTEMPTS = 4  # transient-error retries for both the Anthropic and Google TTS calls
 
 DOCS_DIR = Path("docs")
@@ -94,8 +98,16 @@ def generate_briefing_text() -> str:
         api_key=os.environ["ANTHROPIC_API_KEY"],
         max_retries=API_RETRY_ATTEMPTS,  # SDK retries 429/5xx/connection errors with backoff
     )
-    system_prompt = PROMPT_PATH.read_text()
-    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 15}]
+    # cache_control on the system prompt means every pause_turn resend (below) re-reads this
+    # instead of re-billing it at full price -- it's identical on every request in the loop.
+    system = [{
+        "type": "text",
+        "text": PROMPT_PATH.read_text(),
+        "cache_control": {"type": "ephemeral"},
+    }]
+    # web_search_20260209 (dynamic filtering) isn't available on Haiku 4.5 -- this is the
+    # basic variant older/smaller models use.
+    tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": MAX_WEB_SEARCHES}]
     messages = [{"role": "user", "content": "Go"}]
 
     text_fragments: list[str] = []
@@ -103,7 +115,7 @@ def generate_briefing_text() -> str:
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=MAX_TOKENS,
-            system=system_prompt,
+            system=system,
             tools=tools,
             messages=messages,
         )
@@ -112,7 +124,12 @@ def generate_briefing_text() -> str:
         if response.stop_reason == "pause_turn":
             # Server-side tool loop paused mid-generation. Feed the partial turn back so the
             # next request resumes exactly where it left off (do NOT add a "continue" message).
-            messages.append({"role": "assistant", "content": response.content})
+            # Cache-mark the last block too, so a second pause only pays full price for what's
+            # new since this point rather than re-billing everything gathered so far.
+            content = response.model_dump()["content"]
+            if content:
+                content[-1]["cache_control"] = {"type": "ephemeral"}
+            messages.append({"role": "assistant", "content": content})
             print(f"Turn paused (attempt {attempt + 1}); resuming to finish the briefing.")
             continue
 

@@ -47,9 +47,11 @@ news-podcast/
 
 - Go to **console.anthropic.com -> API Keys -> Create Key**
 - This requires billing on file -- pay-as-you-go, separate from any Claude
-  subscription. For this workload (one briefing a day, capped at 15
-  searches) expect roughly $5-9/month. Worth setting a spending limit in
-  the console as a safety net, same idea as the earlier TTS budget alert
+  subscription. This workload runs on Haiku 4.5 (not Sonnet), one briefing
+  a day, capped at 8 searches -- check the Anthropic Console after a week
+  or two for an actual cost baseline rather than trusting an estimate here.
+  Worth setting a spending limit in the console as a safety net, same idea
+  as the earlier TTS budget alert
 
 ## 6. Add secrets to GitHub
 
